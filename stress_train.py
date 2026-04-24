@@ -1,12 +1,12 @@
 from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow import keras
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.metrics import classification_report, confusion_matrix
 
 
 def build_model(img_size, num_classes):
@@ -35,11 +35,15 @@ def build_model(img_size, num_classes):
     return model, base
 
 
-def train(data_dir="facesData_faces", img_size=128, batch_size=32):
-
+def train(data_dir="facesData", img_size=128, batch_size=32):
     data_path = Path(data_dir)
     train_dir = data_path / "train"
     test_dir = data_path / "test"
+
+    if not train_dir.exists() or not test_dir.exists():
+        raise FileNotFoundError(
+            f"Expected train and test folders inside {data_path}, but one or both are missing."
+        )
 
     train_datagen = ImageDataGenerator(
         rescale=1./255,
