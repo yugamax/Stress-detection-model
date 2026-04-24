@@ -54,7 +54,7 @@ def extract_faces(
                     bw = int(bbox.width * w)
                     bh = int(bbox.height * h)
 
-                    # ✅ Add margin safely
+                    
                     x1 = int(max(0, x - bw * margin))
                     y1 = int(max(0, y - bh * margin))
                     x2 = int(min(w, x + bw * (1 + margin)))
@@ -62,7 +62,7 @@ def extract_faces(
 
                     face = img[y1:y2, x1:x2]
 
-                    # ❌ Skip invalid crops
+                    
                     if face.size == 0 or face.shape[0] < 10 or face.shape[1] < 10:
                         continue
 
@@ -74,7 +74,7 @@ def extract_faces(
                     total_faces += 1
                     faces_found = True
 
-            # ✅ Handle no face detected
+            
             if not faces_found:
                 if save_no_face:
                     # fallback: center crop

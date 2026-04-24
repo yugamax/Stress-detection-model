@@ -76,7 +76,6 @@ def train(data_dir="facesData_faces", img_size=128, batch_size=32):
 
     model, base = build_model(img_size, num_classes)
 
-    # 🔹 Phase 1: Train top layers
     model.fit(
         train_gen,
         validation_data=test_gen,
@@ -86,7 +85,7 @@ def train(data_dir="facesData_faces", img_size=128, batch_size=32):
         ],
     )
 
-    # 🔥 Phase 2: Fine-tune
+
     base.trainable = True
 
     model.compile(
