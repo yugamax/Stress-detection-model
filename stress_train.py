@@ -1,13 +1,25 @@
 from pathlib import Path
+from collections import Counter
 
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 import seaborn as sns
 import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow import keras
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications.efficientnet import preprocess_input
+from sklearn.metrics import classification_report, confusion_matrix
+
+
+class EpochLogger(keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        print(
+            f"Epoch {epoch+1} | "
+            f"loss: {logs['loss']:.4f} | "
+            f"acc: {logs['accuracy']:.4f} | "
+            f"val_loss: {logs['val_loss']:.4f} | "
+            f"val_acc: {logs['val_accuracy']:.4f}"
+        )
 
 
 def build_model(img_size, num_classes):
@@ -17,15 +29,15 @@ def build_model(img_size, num_classes):
         input_shape=(img_size, img_size, 3),
     )
 
-    base.trainable = False  # freeze initially
+    base.trainable = False
 
     x = tf.keras.layers.GlobalAveragePooling2D()(base.output)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dense(128, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.4)(x)
-    output = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
 
-    model = tf.keras.Model(inputs=base.input, outputs=output)
+    model = tf.keras.Model(inputs=base.input, outputs=outputs)
 
     model.compile(
         optimizer=keras.optimizers.Adam(1e-3),
@@ -42,11 +54,8 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
     test_dir = data_path / "test"
 
     if not train_dir.exists() or not test_dir.exists():
-        raise FileNotFoundError(
-            f"Expected train and test folders inside {data_path}, but one or both are missing."
-        )
+        raise FileNotFoundError("Train/Test folders missing")
 
-    # ✅ Correct preprocessing for EfficientNet
     train_datagen = ImageDataGenerator(
         preprocessing_function=preprocess_input,
         horizontal_flip=True,
@@ -78,13 +87,15 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
     )
 
     class_names = list(train_gen.class_indices.keys())
-    num_classes = len(class_names)
-
     print("Classes:", class_names)
 
-    model, base = build_model(img_size, num_classes)
+    print("Train distribution:", Counter(train_gen.classes))
+    print("Test distribution:", Counter(test_gen.classes))
+
+    model, base = build_model(img_size, len(class_names))
 
     callbacks = [
+        EpochLogger(),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,
@@ -99,30 +110,23 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
             verbose=1,
         ),
         keras.callbacks.ModelCheckpoint(
-            "best_stress_efficientnet.keras",
+            "best_model.keras",
             monitor="val_loss",
             save_best_only=True,
             verbose=1,
         ),
     ]
 
-    # =========================
-    # 🔹 Phase 1: Train head
-    # =========================
     history1 = model.fit(
         train_gen,
         validation_data=test_gen,
         epochs=10,
         callbacks=callbacks,
-        verbose=1,
+        verbose=0,
     )
 
-    # =========================
-    # 🔹 Phase 2: Fine-tuning
-    # =========================
     base.trainable = True
 
-    # ✅ Unfreeze only top layers (IMPORTANT)
     for layer in base.layers[:-20]:
         layer.trainable = False
 
@@ -138,16 +142,12 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
         initial_epoch=history1.epoch[-1] + 1,
         epochs=20,
         callbacks=callbacks,
-        verbose=1,
+        verbose=0,
     )
 
-    # =========================
-    # 🔹 Evaluation
-    # =========================
-    loss, acc = model.evaluate(test_gen)
-    print(f"Accuracy: {acc:.4f}")
+    loss, acc = model.evaluate(test_gen, verbose=0)
+    print(f"\nFinal Accuracy: {acc:.4f}")
 
-    # Predictions
     test_gen.reset()
     y_true, y_pred = [], []
 
@@ -174,8 +174,8 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
     plt.savefig("confusion_matrix.png")
     plt.close()
 
-    model.save("stress_efficientnet.keras")
-    print("Model saved!")
+    model.save("stress_model.keras")
+    print("\nModel saved!")
 
 
 if __name__ == "__main__":
