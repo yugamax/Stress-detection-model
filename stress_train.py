@@ -80,13 +80,34 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
 
     model, base = build_model(img_size, num_classes)
 
+    callbacks = [
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=2,
+            min_lr=1e-7,
+            verbose=1,
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=5,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        keras.callbacks.ModelCheckpoint(
+            "best_stress_efficientnet.keras",
+            monitor="val_loss",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
+
     model.fit(
         train_gen,
         validation_data=test_gen,
         epochs=10,
-        callbacks=[
-            keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
-        ],
+        callbacks=callbacks,
+        verbose=2,
     )
 
 
@@ -102,6 +123,8 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
         train_gen,
         validation_data=test_gen,
         epochs=10,
+        callbacks=callbacks,
+        verbose=2,
     )
 
     # Evaluation
