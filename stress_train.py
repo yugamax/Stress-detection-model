@@ -7,6 +7,7 @@ import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow import keras
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.efficientnet import preprocess_input
 
 
 def build_model(img_size, num_classes):
@@ -45,8 +46,9 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
             f"Expected train and test folders inside {data_path}, but one or both are missing."
         )
 
+    # ✅ Correct preprocessing for EfficientNet
     train_datagen = ImageDataGenerator(
-        rescale=1./255,
+        preprocessing_function=preprocess_input,
         horizontal_flip=True,
         rotation_range=25,
         zoom_range=0.2,
@@ -55,7 +57,9 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
         brightness_range=(0.7, 1.3),
     )
 
-    test_datagen = ImageDataGenerator(rescale=1./255)
+    test_datagen = ImageDataGenerator(
+        preprocessing_function=preprocess_input
+    )
 
     train_gen = train_datagen.flow_from_directory(
         train_dir,
@@ -102,32 +106,44 @@ def train(data_dir="facesData", img_size=128, batch_size=32):
         ),
     ]
 
-    model.fit(
+    # =========================
+    # 🔹 Phase 1: Train head
+    # =========================
+    history1 = model.fit(
         train_gen,
         validation_data=test_gen,
         epochs=10,
         callbacks=callbacks,
-        verbose=2,
+        verbose=1,
     )
 
-
+    # =========================
+    # 🔹 Phase 2: Fine-tuning
+    # =========================
     base.trainable = True
 
+    # ✅ Unfreeze only top layers (IMPORTANT)
+    for layer in base.layers[:-20]:
+        layer.trainable = False
+
     model.compile(
-        optimizer=keras.optimizers.Adam(1e-5),  # VERY important (low LR)
+        optimizer=keras.optimizers.Adam(1e-5),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
 
-    model.fit(
+    history2 = model.fit(
         train_gen,
         validation_data=test_gen,
-        epochs=10,
+        initial_epoch=history1.epoch[-1] + 1,
+        epochs=20,
         callbacks=callbacks,
-        verbose=2,
+        verbose=1,
     )
 
-    # Evaluation
+    # =========================
+    # 🔹 Evaluation
+    # =========================
     loss, acc = model.evaluate(test_gen)
     print(f"Accuracy: {acc:.4f}")
 
