@@ -1,6 +1,9 @@
 from pathlib import Path
 from collections import Counter
 import os
+import json
+import warnings
+
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -11,14 +14,65 @@ from tensorflow.keras.applications.efficientnet import preprocess_input
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 
+os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+warnings.filterwarnings("ignore")
+
+BASE_DIR   = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "training_state.json"
+MODEL_FILE = BASE_DIR / "latest_model.keras"
+BASE_FILE  = BASE_DIR / "base_model.keras"
+
+PHASE1_EPOCHS    = 15
+PHASE2_EPOCHS    = 40
+VALIDATION_SPLIT = 0.2
 
 
-# -------------------------------
-# MODEL
-# -------------------------------
-def build_model(img_size, num_classes):
-    base = tf.keras.applications.EfficientNetB3(
+# ── State helpers ──────────────────────────────────────────────────────────────
+
+def save_state(phase: str, epoch: int):
+    STATE_FILE.write_text(json.dumps({"phase": phase, "epoch": epoch}))
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"phase": "phase1", "epoch": 0}
+    return json.loads(STATE_FILE.read_text())
+
+
+class EpochCheckpoint(keras.callbacks.Callback):
+    def __init__(self, phase: str):
+        super().__init__()
+        self.phase = phase
+
+    def on_epoch_end(self, epoch, logs=None):
+        save_state(self.phase, epoch + 1)
+
+
+# ── Data directories ───────────────────────────────────────────────────────────
+
+def resolve_data_dirs(data_path: Path):
+    train_dir = data_path / "train"
+    val_dir   = data_path / "val"
+    test_dir  = data_path / "test"
+
+    if not train_dir.exists() or not test_dir.exists():
+        raise FileNotFoundError("train/ and test/ folders are required.")
+
+    has_val = val_dir.exists()
+    return train_dir, val_dir if has_val else None, test_dir, not has_val
+
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+
+def build_model(img_size: int, num_classes: int):
+    """
+    Lighter classification head:
+    - Single dense layer (512) instead of two stacked ones
+    - Moderate dropout (0.5) to regularise without over-suppressing signal
+    - GeM pooling via GlobalAveragePooling2D (standard, stable)
+    """
+    base = keras.applications.EfficientNetB0(
         include_top=False,
         weights="imagenet",
         input_shape=(img_size, img_size, 3),
@@ -26,197 +80,212 @@ def build_model(img_size, num_classes):
 
     x = keras.layers.GlobalAveragePooling2D()(base.output)
     x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Dense(
+            512,
+            activation="relu",
+            kernel_regularizer=keras.regularizers.l2(1e-4),
+        )(x)
+    x = keras.layers.Dropout(0.5)(x)
 
-    x = keras.layers.Dense(256, activation="relu",
-                           kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x = keras.layers.Dropout(0.4)(x)
-
-    x = keras.layers.Dense(128, activation="relu",
-                           kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x = keras.layers.Dropout(0.3)(x)
-
-    outputs = keras.layers.Dense(num_classes, activation="softmax")(x)
+    activation = "sigmoid" if num_classes == 2 else "softmax"
+    output_units = 1 if num_classes == 2 else num_classes
+    outputs = keras.layers.Dense(output_units, activation=activation)(x)
 
     model = keras.Model(inputs=base.input, outputs=outputs)
     return model, base
 
 
-# -------------------------------
-# TRAINING
-# -------------------------------
-def train(data_dir="facesData", img_size=224, batch_size=32):
+def compile_model(model, lr: float, num_classes: int):
+    if num_classes == 2:
+        loss    = "binary_crossentropy"
+        metrics = [keras.metrics.BinaryAccuracy(name="accuracy"),
+                   keras.metrics.AUC(name="auc")]
+    else:
+        loss    = "sparse_categorical_crossentropy"
+        metrics = [keras.metrics.SparseCategoricalAccuracy(name="accuracy")]
 
+    model.compile(optimizer=keras.optimizers.Adam(lr), loss=loss, metrics=metrics)
+
+
+# ── Training ───────────────────────────────────────────────────────────────────
+
+def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32):
+
+    state     = load_state()
     data_path = Path(data_dir)
-    train_dir = data_path / "train"
-    test_dir = data_path / "test"
+    train_dir, val_dir, test_dir, use_split_val = resolve_data_dirs(data_path)
 
-    if not train_dir.exists() or not test_dir.exists():
-        raise FileNotFoundError("Train/Test folders missing")
-
-    # 🔥 Stronger augmentation
+    # ── Generators ────────────────────────────────────────────────────────────
+    # Augmentation is intentionally moderate — aggressive transforms
+    # (strong colour jitter, large shifts) hurt face recognition tasks.
     train_datagen = ImageDataGenerator(
         preprocessing_function=preprocess_input,
-        rotation_range=25,
-        zoom_range=0.2,
-        width_shift_range=0.15,
-        height_shift_range=0.15,
+        validation_split=VALIDATION_SPLIT if use_split_val else 0.0,
+        rotation_range=15,
+        zoom_range=0.15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
         horizontal_flip=True,
-        brightness_range=(0.7, 1.3),
-        shear_range=0.1
+        brightness_range=(0.8, 1.2),
     )
+    plain_datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
 
-    test_datagen = ImageDataGenerator(
-        preprocessing_function=preprocess_input
-    )
-
-    train_gen = train_datagen.flow_from_directory(
-        train_dir,
+    flow_kw = dict(
         target_size=(img_size, img_size),
         batch_size=batch_size,
-        class_mode="sparse",
-        shuffle=True,
+        seed=42,
     )
 
-    test_gen = test_datagen.flow_from_directory(
-        test_dir,
-        target_size=(img_size, img_size),
-        batch_size=batch_size,
-        class_mode="sparse",
-        shuffle=False,
-    )
+    if use_split_val:
+        train_gen = train_datagen.flow_from_directory(
+            train_dir, subset="training",   shuffle=True,  class_mode="sparse", **flow_kw)
+        val_gen   = train_datagen.flow_from_directory(
+            train_dir, subset="validation", shuffle=False, class_mode="sparse", **flow_kw)
+    else:
+        train_gen = train_datagen.flow_from_directory(
+            train_dir, shuffle=True,  class_mode="sparse", **flow_kw)
+        val_gen   = plain_datagen.flow_from_directory(
+            val_dir,   shuffle=False, class_mode="sparse", **flow_kw)
+
+    test_gen = plain_datagen.flow_from_directory(
+        test_dir, shuffle=False, class_mode="sparse", **flow_kw)
 
     class_names = list(train_gen.class_indices.keys())
+    num_classes = len(class_names)
 
-    print("Train distribution:", Counter(train_gen.classes))
-    print("Test distribution:", Counter(test_gen.classes))
+    print(f"\nClasses ({num_classes}): {class_names}")
+    print("Train:", Counter(train_gen.classes))
+    print("Val:  ", Counter(val_gen.classes))
+    print("Test: ", Counter(test_gen.classes))
 
-    # ✅ CLASS WEIGHTS (IMPORTANT)
-    class_weights = compute_class_weight(
-        class_weight="balanced",
-        classes=np.unique(train_gen.classes),
-        y=train_gen.classes,
-    )
-    class_weights = dict(enumerate(class_weights))
-    print("Class weights:", class_weights)
+    # ── Class weights ─────────────────────────────────────────────────────────
+    class_weights = dict(enumerate(
+        compute_class_weight("balanced",
+                             classes=np.unique(train_gen.classes),
+                             y=train_gen.classes)
+    ))
 
-    model, base = build_model(img_size, len(class_names))
+    # ── Binary label mapping for 2-class case ─────────────────────────────────
+    # flow_from_directory always emits sparse integer labels (0 / 1).
+    # binary_crossentropy expects the same, so no remapping needed.
 
-    # -------------------------------
-    # PHASE 1: Train head
-    # -------------------------------
-    base.trainable = False
+    # ── Load or build model ───────────────────────────────────────────────────
+    if MODEL_FILE.exists():
+        model = keras.models.load_model(str(MODEL_FILE))
+        if BASE_FILE.exists():
+            base = keras.models.load_model(str(BASE_FILE))
+        else:
+            base = next(
+                (l for l in model.layers if "efficientnet" in l.name.lower()), None
+            )
+            if base is None:
+                model, base = build_model(img_size, num_classes)
+    else:
+        model, base = build_model(img_size, num_classes)
 
-    model.compile(
-        optimizer=keras.optimizers.Adam(3e-4),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy",
-                 tf.keras.metrics.Precision(name="precision"),
-                 tf.keras.metrics.Recall(name="recall")]
-    )
+    # ── Common callbacks factory ──────────────────────────────────────────────
+    def make_callbacks(phase: str):
+        return [
+            EpochCheckpoint(phase),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.3, patience=3,
+                min_lr=1e-7, verbose=1),
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=8,
+                restore_best_weights=True, verbose=1),
+            keras.callbacks.ModelCheckpoint(
+                str(MODEL_FILE), save_best_only=False, verbose=0),
+        ]
 
-    callbacks = [
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.3,
-            patience=2,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=6,
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        keras.callbacks.ModelCheckpoint(
-            "best_model.keras",
-            monitor="val_loss",
-            save_best_only=True,
-            verbose=1,
-        ),
-    ]
+    # ── Phase 1: train head only ──────────────────────────────────────────────
+    if state["phase"] == "phase1":
+        base.trainable = False
+        compile_model(model, lr=3e-4, num_classes=num_classes)
 
-    print("\n🚀 Phase 1: Training top layers...")
-    model.fit(
-        train_gen,
-        validation_data=test_gen,
-        epochs=12,
-        class_weight=class_weights,
-        callbacks=callbacks,
-        verbose=1,
-    )
+        model.fit(
+            train_gen,
+            validation_data=val_gen,
+            epochs=PHASE1_EPOCHS,
+            initial_epoch=state["epoch"],
+            class_weight=class_weights,
+            callbacks=make_callbacks("phase1"),
+            verbose=0,
+        )
+        save_state("phase2", 0)
+        state = {"phase": "phase2", "epoch": 0}
+        base.save(str(BASE_FILE))
 
-    # -------------------------------
-    # PHASE 2: Fine-tuning
-    # -------------------------------
-    print("\n🔥 Phase 2: Fine-tuning...")
+    # ── Phase 2: fine-tune top layers ─────────────────────────────────────────
+    if state["phase"] == "phase2":
+        base.trainable = True
 
-    base.trainable = True
+        # Freeze everything except the last 100 layers
+        for layer in base.layers[:-100]:
+            layer.trainable = False
 
-    # Freeze early layers, train deeper layers
-    for layer in base.layers[:-120]:
-        layer.trainable = False
+        # Keep BN layers frozen during fine-tuning — updating them with a small
+        # batch destabilises running statistics and often hurts accuracy.
+        for layer in base.layers:
+            if isinstance(layer, keras.layers.BatchNormalization):
+                layer.trainable = False
 
-    model.compile(
-        optimizer=keras.optimizers.Adam(1e-5),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy",
-                 tf.keras.metrics.Precision(name="precision"),
-                 tf.keras.metrics.Recall(name="recall")]
-    )
+        compile_model(model, lr=5e-6, num_classes=num_classes)
 
-    model.fit(
-        train_gen,
-        validation_data=test_gen,
-        epochs=30,
-        class_weight=class_weights,
-        callbacks=callbacks,
-        verbose=1,
-    )
+        model.fit(
+            train_gen,
+            validation_data=val_gen,
+            epochs=PHASE2_EPOCHS,
+            initial_epoch=state["epoch"],
+            class_weight=class_weights,
+            callbacks=make_callbacks("phase2"),
+            verbose=0,
+        )
 
-    # -------------------------------
-    # EVALUATION
-    # -------------------------------
-    loss, acc, prec, rec = model.evaluate(test_gen, verbose=0)
-    print(f"\nFinal Accuracy: {acc:.4f}")
-    print(f"Precision: {prec:.4f}, Recall: {rec:.4f}")
+    # ── Evaluation ────────────────────────────────────────────────────────────
+    results = model.evaluate(test_gen, verbose=0)
 
     test_gen.reset()
-    y_true, y_pred = [], []
-
+    all_probs, all_true = [], []
     for images, labels in test_gen:
-        preds = model.predict(images, verbose=0)
-
-        # 🔥 THRESHOLD TUNING (adjust this)
-        threshold = 0.6
-        preds_binary = (preds[:, 1] > threshold).astype(int)
-
-        y_pred.extend(preds_binary)
-        y_true.extend(labels)
-
-        if len(y_true) >= test_gen.samples:
+        all_probs.append(model.predict(images, verbose=0))
+        all_true.extend(labels)
+        if len(all_true) >= test_gen.samples:
             break
 
-    print("\nClassification Report:\n")
-    print(classification_report(y_true, y_pred, target_names=class_names))
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_true  = np.array(all_true, dtype=int)
 
-    cm = confusion_matrix(y_true, y_pred)
+    if num_classes == 2:
+        # Binary: find threshold that maximises macro-F1
+        from sklearn.metrics import f1_score
+        probs_pos = all_probs.ravel()
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.arange(0.3, 0.8, 0.02):
+            preds = (probs_pos >= t).astype(int)
+            f1    = f1_score(all_true, preds, average="macro", zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        y_pred = (probs_pos >= best_t).astype(int)
+    else:
+        y_pred = np.argmax(all_probs, axis=1)
 
-    plt.figure(figsize=(8, 6))
+    classification_report(all_true, y_pred,
+                          target_names=class_names, zero_division=0)
+
+    cm = confusion_matrix(all_true, y_pred)
+    plt.figure(figsize=(max(6, num_classes), max(5, num_classes - 1)))
     sns.heatmap(cm, annot=True, fmt="d",
-                xticklabels=class_names,
-                yticklabels=class_names)
+                xticklabels=class_names, yticklabels=class_names, cmap="Blues")
+    plt.title("Confusion Matrix")
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.title("Confusion Matrix")
     plt.tight_layout()
-    plt.savefig("confusion_matrix.png")
+    plt.savefig("confusion_matrix.png", dpi=150)
     plt.close()
 
     model.save("stress_model.keras")
-    print("\n✅ Model saved!")
 
 
-# -------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     train()
