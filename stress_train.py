@@ -13,6 +13,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications.efficientnet import preprocess_input
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -194,7 +195,7 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
                 monitor="val_loss", patience=8,
                 restore_best_weights=True, verbose=1),
             keras.callbacks.ModelCheckpoint(
-                str(MODEL_FILE), save_best_only=False, verbose=0),
+                str(MODEL_FILE), save_best_only=True, verbose=0),
         ]
 
     # ── Phase 1: train head only ──────────────────────────────────────────────
@@ -209,7 +210,7 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
             initial_epoch=state["epoch"],
             class_weight=class_weights,
             callbacks=make_callbacks("phase1"),
-            verbose=0,
+            verbose=2,
         )
         save_state("phase2", 0)
         state = {"phase": "phase2", "epoch": 0}
@@ -219,17 +220,13 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
     if state["phase"] == "phase2":
         base.trainable = True
 
-        # Freeze everything except the last 100 layers
-        for layer in base.layers[:-100]:
-            layer.trainable = False
-
-        # Keep BN layers frozen during fine-tuning — updating them with a small
-        # batch destabilises running statistics and often hurts accuracy.
+        # Freeze all layers first, then unfreeze the last 150 layers
         for layer in base.layers:
-            if isinstance(layer, keras.layers.BatchNormalization):
-                layer.trainable = False
+            layer.trainable = False
+        for layer in base.layers[-150:]:
+            layer.trainable = True
 
-        compile_model(model, lr=5e-6, num_classes=num_classes)
+        compile_model(model, lr=2e-5, num_classes=num_classes)
 
         model.fit(
             train_gen,
@@ -238,7 +235,7 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
             initial_epoch=state["epoch"],
             class_weight=class_weights,
             callbacks=make_callbacks("phase2"),
-            verbose=0,
+            verbose=2,
         )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -246,7 +243,7 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
 
     test_gen.reset()
     all_probs, all_true = [], []
-    for images, labels in test_gen:
+    for images, labels in tqdm(test_gen, total=test_gen.samples // test_gen.batch_size, desc="Evaluating"):
         all_probs.append(model.predict(images, verbose=0))
         all_true.extend(labels)
         if len(all_true) >= test_gen.samples:
@@ -260,7 +257,7 @@ def train(data_dir: str = "facesData", img_size: int = 224, batch_size: int = 32
         from sklearn.metrics import f1_score
         probs_pos = all_probs.ravel()
         best_t, best_f1 = 0.5, 0.0
-        for t in np.arange(0.3, 0.8, 0.02):
+        for t in tqdm(np.arange(0.3, 0.8, 0.02), desc="Finding optimal threshold"):
             preds = (probs_pos >= t).astype(int)
             f1    = f1_score(all_true, preds, average="macro", zero_division=0)
             if f1 > best_f1:
